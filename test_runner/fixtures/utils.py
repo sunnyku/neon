@@ -9,6 +9,7 @@ import tarfile
 import threading
 import time
 from collections.abc import Callable, Iterable
+from datetime import datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -56,6 +57,10 @@ VERSIONS_COMBINATIONS = (
     {"storage_controller": "old", "storage_broker": "old", "compute": "new", "safekeeper": "new", "pageserver": "new"},
 )
 # fmt: on
+
+# If the environment variable USE_LFC is set and its value is "false", then LFC is disabled for tests.
+# If it is not set or set to a value not equal to "false", LFC is enabled by default.
+USE_LFC = os.environ.get("USE_LFC") != "false"
 
 
 def subprocess_capture(
@@ -376,15 +381,10 @@ def start_in_background(
             if return_code is not None:
                 error = f"expected subprocess to run but it exited with code {return_code}"
             else:
-                attempts = 10
                 try:
-                    wait_until(
-                        number_of_iterations=attempts,
-                        interval=1,
-                        func=is_started,
-                    )
+                    wait_until(is_started, timeout=10)
                 except Exception:
-                    error = f"Failed to get correct status from subprocess in {attempts} attempts"
+                    error = "Failed to get correct status from subprocess"
         except Exception as e:
             error = f"expected subprocess to start but it failed with exception: {e}"
 
@@ -398,28 +398,31 @@ def start_in_background(
 
 
 def wait_until(
-    number_of_iterations: int,
-    interval: float,
     func: Callable[[], WaitUntilRet],
-    show_intermediate_error: bool = False,
+    name: str | None = None,
+    timeout: float = 20.0,  # seconds
+    interval: float = 0.5,  # seconds
+    status_interval: float = 1.0,  # seconds
 ) -> WaitUntilRet:
     """
     Wait until 'func' returns successfully, without exception. Returns the
     last return value from the function.
     """
+    if name is None:
+        name = getattr(func, "__name__", repr(func))
+    deadline = datetime.now() + timedelta(seconds=timeout)
+    next_status = datetime.now()
     last_exception = None
-    for i in range(number_of_iterations):
+    while datetime.now() <= deadline:
         try:
-            res = func()
+            return func()
         except Exception as e:
-            log.info("waiting for %s iteration %s failed: %s", func, i + 1, e)
+            if datetime.now() >= next_status:
+                log.info("waiting for %s: %s", name, e)
+                next_status = datetime.now() + timedelta(seconds=status_interval)
             last_exception = e
-            if show_intermediate_error:
-                log.info(e)
             time.sleep(interval)
-            continue
-        return res
-    raise Exception(f"timed out while waiting for {func}") from last_exception
+    raise Exception(f"timed out while waiting for {name}") from last_exception
 
 
 def assert_eq(a, b) -> None:
@@ -653,6 +656,23 @@ def allpairs_versions():
     return {"argnames": "combination", "argvalues": tuple(argvalues), "ids": ids}
 
 
+def size_to_bytes(hr_size: str) -> int:
+    """
+    Gets human-readable size from postgresql.conf (e.g. 512kB, 10MB)
+    returns size in bytes
+    """
+    units = {"B": 1, "kB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4, "PB": 1024**5}
+    match = re.search(r"^\'?(\d+)\s*([kMGTP]?B)?\'?$", hr_size)
+    assert match is not None, f'"{hr_size}" is not a well-formatted human-readable size'
+    number, unit = match.groups()
+
+    if unit:
+        amp = units[unit]
+    else:
+        amp = 8192
+    return int(number) * amp
+
+
 def skip_on_postgres(version: PgVersion, reason: str):
     return pytest.mark.skipif(
         PgVersion(os.getenv("DEFAULT_PG_VERSION", PgVersion.DEFAULT)) is version,
@@ -670,6 +690,13 @@ def xfail_on_postgres(version: PgVersion, reason: str):
 def run_only_on_default_postgres(reason: str):
     return pytest.mark.skipif(
         PgVersion(os.getenv("DEFAULT_PG_VERSION", PgVersion.DEFAULT)) is not PgVersion.DEFAULT,
+        reason=reason,
+    )
+
+
+def run_only_on_postgres(versions: Iterable[PgVersion], reason: str):
+    return pytest.mark.skipif(
+        PgVersion(os.getenv("DEFAULT_PG_VERSION", PgVersion.DEFAULT)) not in versions,
         reason=reason,
     )
 

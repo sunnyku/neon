@@ -199,7 +199,7 @@ use utils::backoff::{
 use utils::pausable_failpoint;
 use utils::shard::ShardNumber;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -223,7 +223,7 @@ use crate::task_mgr::shutdown_token;
 use crate::tenant::debug_assert_current_span_has_tenant_and_timeline_id;
 use crate::tenant::remote_timeline_client::download::download_retry;
 use crate::tenant::storage_layer::AsLayerDesc;
-use crate::tenant::upload_queue::{Delete, UploadQueueStoppedDeletable};
+use crate::tenant::upload_queue::{Delete, OpType, UploadQueueStoppedDeletable};
 use crate::tenant::TIMELINES_SEGMENT_NAME;
 use crate::{
     config::PageServerConf,
@@ -244,6 +244,7 @@ use self::index::IndexPart;
 use super::config::AttachedLocationConfig;
 use super::metadata::MetadataUpdate;
 use super::storage_layer::{Layer, LayerName, ResidentLayer};
+use super::timeline::import_pgdata;
 use super::upload_queue::{NotInitialized, SetDeletedFlagProgress};
 use super::{DeleteTimelineError, Generation};
 
@@ -680,6 +681,7 @@ impl RemoteTimelineClient {
         layer_file_name: &LayerName,
         layer_metadata: &LayerFileMetadata,
         local_path: &Utf8Path,
+        gate: &utils::sync::gate::Gate,
         cancel: &CancellationToken,
         ctx: &RequestContext,
     ) -> Result<u64, DownloadError> {
@@ -699,6 +701,7 @@ impl RemoteTimelineClient {
                 layer_file_name,
                 layer_metadata,
                 local_path,
+                gate,
                 cancel,
                 ctx,
             )
@@ -811,6 +814,18 @@ impl RemoteTimelineClient {
 
         let need_wait = need_change(&upload_queue.clean.0.archived_at, state).is_some();
         Ok(need_wait)
+    }
+
+    /// Launch an index-file upload operation in the background, setting `import_pgdata` field.
+    pub(crate) fn schedule_index_upload_for_import_pgdata_state_update(
+        self: &Arc<Self>,
+        state: Option<import_pgdata::index_part_format::Root>,
+    ) -> anyhow::Result<()> {
+        let mut guard = self.upload_queue.lock().unwrap();
+        let upload_queue = guard.initialized_mut()?;
+        upload_queue.dirty.import_pgdata = state;
+        self.schedule_index_upload(upload_queue)?;
+        Ok(())
     }
 
     ///
@@ -1090,7 +1105,7 @@ impl RemoteTimelineClient {
             "scheduled layer file upload {layer}",
         );
 
-        let op = UploadOp::UploadLayer(layer, metadata);
+        let op = UploadOp::UploadLayer(layer, metadata, None);
         self.metric_begin(&op);
         upload_queue.queued_operations.push_back(op);
     }
@@ -1805,7 +1820,7 @@ impl RemoteTimelineClient {
                     // have finished.
                     upload_queue.inprogress_tasks.is_empty()
                 }
-                UploadOp::Delete(_) => {
+                UploadOp::Delete(..) => {
                     // Wait for preceding uploads to finish. Concurrent deletions are OK, though.
                     upload_queue.num_inprogress_deletions == upload_queue.inprogress_tasks.len()
                 }
@@ -1833,19 +1848,32 @@ impl RemoteTimelineClient {
             }
 
             // We can launch this task. Remove it from the queue first.
-            let next_op = upload_queue.queued_operations.pop_front().unwrap();
+            let mut next_op = upload_queue.queued_operations.pop_front().unwrap();
 
             debug!("starting op: {}", next_op);
 
-            // Update the counters
-            match next_op {
-                UploadOp::UploadLayer(_, _) => {
+            // Update the counters and prepare
+            match &mut next_op {
+                UploadOp::UploadLayer(layer, meta, mode) => {
+                    if upload_queue
+                        .recently_deleted
+                        .remove(&(layer.layer_desc().layer_name().clone(), meta.generation))
+                    {
+                        *mode = Some(OpType::FlushDeletion);
+                    } else {
+                        *mode = Some(OpType::MayReorder)
+                    }
                     upload_queue.num_inprogress_layer_uploads += 1;
                 }
                 UploadOp::UploadMetadata { .. } => {
                     upload_queue.num_inprogress_metadata_uploads += 1;
                 }
-                UploadOp::Delete(_) => {
+                UploadOp::Delete(Delete { layers }) => {
+                    for (name, meta) in layers {
+                        upload_queue
+                            .recently_deleted
+                            .insert((name.clone(), meta.generation));
+                    }
                     upload_queue.num_inprogress_deletions += 1;
                 }
                 UploadOp::Barrier(sender) => {
@@ -1921,7 +1949,66 @@ impl RemoteTimelineClient {
             }
 
             let upload_result: anyhow::Result<()> = match &task.op {
-                UploadOp::UploadLayer(ref layer, ref layer_metadata) => {
+                UploadOp::UploadLayer(ref layer, ref layer_metadata, mode) => {
+                    if let Some(OpType::FlushDeletion) = mode {
+                        if self.config.read().unwrap().block_deletions {
+                            // Of course, this is not efficient... but usually the queue should be empty.
+                            let mut queue_locked = self.upload_queue.lock().unwrap();
+                            let mut detected = false;
+                            if let Ok(queue) = queue_locked.initialized_mut() {
+                                for list in queue.blocked_deletions.iter_mut() {
+                                    list.layers.retain(|(name, meta)| {
+                                        if name == &layer.layer_desc().layer_name()
+                                            && meta.generation == layer_metadata.generation
+                                        {
+                                            detected = true;
+                                            // remove the layer from deletion queue
+                                            false
+                                        } else {
+                                            // keep the layer
+                                            true
+                                        }
+                                    });
+                                }
+                            }
+                            if detected {
+                                info!(
+                                    "cancelled blocked deletion of layer {} at gen {:?}",
+                                    layer.layer_desc().layer_name(),
+                                    layer_metadata.generation
+                                );
+                            }
+                        } else {
+                            // TODO: we did not guarantee that upload task starts after deletion task, so there could be possibly race conditions
+                            // that we still get the layer deleted. But this only happens if someone creates a layer immediately after it's deleted,
+                            // which is not possible in the current system.
+                            info!(
+                                "waiting for deletion queue flush to complete before uploading layer {} at gen {:?}",
+                                layer.layer_desc().layer_name(),
+                                layer_metadata.generation
+                            );
+                            {
+                                // We are going to flush, we can clean up the recently deleted list.
+                                let mut queue_locked = self.upload_queue.lock().unwrap();
+                                if let Ok(queue) = queue_locked.initialized_mut() {
+                                    queue.recently_deleted.clear();
+                                }
+                            }
+                            if let Err(e) = self.deletion_queue_client.flush_execute().await {
+                                warn!(
+                                    "failed to flush the deletion queue before uploading layer {} at gen {:?}, still proceeding to upload: {e:#} ",
+                                    layer.layer_desc().layer_name(),
+                                    layer_metadata.generation
+                                );
+                            } else {
+                                info!(
+                                    "done flushing deletion queue before uploading layer {} at gen {:?}",
+                                    layer.layer_desc().layer_name(),
+                                    layer_metadata.generation
+                                );
+                            }
+                        }
+                    }
                     let local_path = layer.local_path();
 
                     // We should only be uploading layers created by this `Tenant`'s lifetime, so
@@ -2085,7 +2172,7 @@ impl RemoteTimelineClient {
             upload_queue.inprogress_tasks.remove(&task.task_id);
 
             let lsn_update = match task.op {
-                UploadOp::UploadLayer(_, _) => {
+                UploadOp::UploadLayer(_, _, _) => {
                     upload_queue.num_inprogress_layer_uploads -= 1;
                     None
                 }
@@ -2105,6 +2192,9 @@ impl RemoteTimelineClient {
                     upload_queue.clean.1 = Some(task.task_id);
 
                     let lsn = upload_queue.clean.0.metadata.disk_consistent_lsn();
+                    self.metrics
+                        .projected_remote_consistent_lsn_gauge
+                        .set(lsn.0);
 
                     if self.generation.is_none() {
                         // Legacy mode: skip validating generation
@@ -2162,7 +2252,7 @@ impl RemoteTimelineClient {
     )> {
         use RemoteTimelineClientMetricsCallTrackSize::DontTrackSize;
         let res = match op {
-            UploadOp::UploadLayer(_, m) => (
+            UploadOp::UploadLayer(_, m, _) => (
                 RemoteOpFileKind::Layer,
                 RemoteOpKind::Upload,
                 RemoteTimelineClientMetricsCallTrackSize::Bytes(m.file_size),
@@ -2259,6 +2349,7 @@ impl RemoteTimelineClient {
                         blocked_deletions: Vec::new(),
                         shutting_down: false,
                         shutdown_ready: Arc::new(tokio::sync::Semaphore::new(0)),
+                        recently_deleted: HashSet::new(),
                     };
 
                     let upload_queue = std::mem::replace(
@@ -2478,9 +2569,9 @@ pub fn parse_remote_index_path(path: RemotePath) -> Option<Generation> {
 }
 
 /// Given the key of a tenant manifest, parse out the generation number
-pub(crate) fn parse_remote_tenant_manifest_path(path: RemotePath) -> Option<Generation> {
+pub fn parse_remote_tenant_manifest_path(path: RemotePath) -> Option<Generation> {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r".+tenant-manifest-([0-9a-f]{8}).json").unwrap());
+    let re = RE.get_or_init(|| Regex::new(r".*tenant-manifest-([0-9a-f]{8}).json").unwrap());
     re.captures(path.get_path().as_str())
         .and_then(|c| c.get(1))
         .and_then(|m| Generation::parse_suffix(m.as_str()))

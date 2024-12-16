@@ -18,7 +18,7 @@ use std::{
     str::FromStr,
     time::Duration,
 };
-use utils::logging::LogFormat;
+use utils::{logging::LogFormat, postgres_client::PostgresClientProtocol};
 
 use crate::models::ImageCompressionAlgorithm;
 use crate::models::LsnLease;
@@ -97,6 +97,15 @@ pub struct ConfigToml {
     pub control_plane_api: Option<reqwest::Url>,
     pub control_plane_api_token: Option<String>,
     pub control_plane_emergency_mode: bool,
+    /// Unstable feature: subject to change or removal without notice.
+    /// See <https://github.com/neondatabase/neon/pull/9218>.
+    pub import_pgdata_upcall_api: Option<reqwest::Url>,
+    /// Unstable feature: subject to change or removal without notice.
+    /// See <https://github.com/neondatabase/neon/pull/9218>.
+    pub import_pgdata_upcall_api_token: Option<String>,
+    /// Unstable feature: subject to change or removal without notice.
+    /// See <https://github.com/neondatabase/neon/pull/9218>.
+    pub import_pgdata_aws_endpoint_url: Option<reqwest::Url>,
     pub heatmap_upload_concurrency: usize,
     pub secondary_download_concurrency: usize,
     pub virtual_file_io_engine: Option<crate::models::virtual_file::IoEngineKind>,
@@ -109,8 +118,8 @@ pub struct ConfigToml {
     pub virtual_file_io_mode: Option<crate::models::virtual_file::IoMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_sync: Option<bool>,
-    #[serde(with = "humantime_serde")]
-    pub server_side_batch_timeout: Option<Duration>,
+    pub wal_receiver_protocol: PostgresClientProtocol,
+    pub page_service_pipelining: PageServicePipeliningConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -125,6 +134,28 @@ pub struct DiskUsageEvictionTaskConfig {
     /// Select sorting for evicted layers
     #[serde(default)]
     pub eviction_order: EvictionOrder,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "mode", rename_all = "kebab-case")]
+#[serde(deny_unknown_fields)]
+pub enum PageServicePipeliningConfig {
+    Serial,
+    Pipelined(PageServicePipeliningConfigPipelined),
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageServicePipeliningConfigPipelined {
+    /// Causes runtime errors if larger than max get_vectored batch size.
+    pub max_batch_size: NonZeroUsize,
+    pub execution: PageServiceProtocolPipelinedExecutionStrategy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PageServiceProtocolPipelinedExecutionStrategy {
+    ConcurrentFutures,
+    Tasks,
 }
 
 pub mod statvfs {
@@ -268,6 +299,8 @@ pub struct TenantConfigToml {
     /// Enable auto-offloading of timelines.
     /// (either this flag or the pageserver-global one need to be set)
     pub timeline_offloading: bool,
+
+    pub wal_receiver_protocol_override: Option<PostgresClientProtocol>,
 }
 
 pub mod defaults {
@@ -320,7 +353,8 @@ pub mod defaults {
 
     pub const DEFAULT_IO_BUFFER_ALIGNMENT: usize = 512;
 
-    pub const DEFAULT_SERVER_SIDE_BATCH_TIMEOUT: Option<&str> = None;
+    pub const DEFAULT_WAL_RECEIVER_PROTOCOL: utils::postgres_client::PostgresClientProtocol =
+        utils::postgres_client::PostgresClientProtocol::Vanilla;
 }
 
 impl Default for ConfigToml {
@@ -386,6 +420,10 @@ impl Default for ConfigToml {
             control_plane_api_token: (None),
             control_plane_emergency_mode: (false),
 
+            import_pgdata_upcall_api: (None),
+            import_pgdata_upcall_api_token: (None),
+            import_pgdata_aws_endpoint_url: (None),
+
             heatmap_upload_concurrency: (DEFAULT_HEATMAP_UPLOAD_CONCURRENCY),
             secondary_download_concurrency: (DEFAULT_SECONDARY_DOWNLOAD_CONCURRENCY),
 
@@ -401,10 +439,17 @@ impl Default for ConfigToml {
             ephemeral_bytes_per_memory_kb: (DEFAULT_EPHEMERAL_BYTES_PER_MEMORY_KB),
             l0_flush: None,
             virtual_file_io_mode: None,
-            server_side_batch_timeout: DEFAULT_SERVER_SIDE_BATCH_TIMEOUT
-                .map(|duration| humantime::parse_duration(duration).unwrap()),
             tenant_config: TenantConfigToml::default(),
             no_sync: None,
+            wal_receiver_protocol: DEFAULT_WAL_RECEIVER_PROTOCOL,
+            page_service_pipelining: if !cfg!(test) {
+                PageServicePipeliningConfig::Serial
+            } else {
+                PageServicePipeliningConfig::Pipelined(PageServicePipeliningConfigPipelined {
+                    max_batch_size: NonZeroUsize::new(32).unwrap(),
+                    execution: PageServiceProtocolPipelinedExecutionStrategy::ConcurrentFutures,
+                })
+            },
         }
     }
 }
@@ -492,6 +537,7 @@ impl Default for TenantConfigToml {
             lsn_lease_length: LsnLease::DEFAULT_LENGTH,
             lsn_lease_length_for_ts: LsnLease::DEFAULT_LENGTH_FOR_TS,
             timeline_offloading: false,
+            wal_receiver_protocol_override: None,
         }
     }
 }

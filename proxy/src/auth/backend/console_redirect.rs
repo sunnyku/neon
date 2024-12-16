@@ -1,11 +1,12 @@
 use async_trait::async_trait;
+use postgres_client::config::SslMode;
 use pq_proto::BeMessage as Be;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_postgres::config::SslMode;
 use tracing::{info, info_span};
 
 use super::ComputeCredentialKeys;
+use crate::auth::IpPattern;
 use crate::cache::Cached;
 use crate::config::AuthenticationConfig;
 use crate::context::RequestContext;
@@ -48,13 +49,19 @@ impl ReportableError for ConsoleRedirectError {
     }
 }
 
-fn hello_message(redirect_uri: &reqwest::Url, session_id: &str) -> String {
+fn hello_message(
+    redirect_uri: &reqwest::Url,
+    session_id: &str,
+    duration: std::time::Duration,
+) -> String {
+    let formatted_duration = humantime::format_duration(duration).to_string();
     format!(
         concat![
             "Welcome to Neon!\n",
-            "Authenticate by visiting:\n",
+            "Authenticate by visiting (will expire in {duration}):\n",
             "    {redirect_uri}{session_id}\n\n",
         ],
+        duration = formatted_duration,
         redirect_uri = redirect_uri,
         session_id = session_id,
     )
@@ -74,10 +81,10 @@ impl ConsoleRedirectBackend {
         ctx: &RequestContext,
         auth_config: &'static AuthenticationConfig,
         client: &mut PqStream<impl AsyncRead + AsyncWrite + Unpin>,
-    ) -> auth::Result<ConsoleRedirectNodeInfo> {
+    ) -> auth::Result<(ConsoleRedirectNodeInfo, Option<Vec<IpPattern>>)> {
         authenticate(ctx, auth_config, &self.console_uri, client)
             .await
-            .map(ConsoleRedirectNodeInfo)
+            .map(|(node_info, ip_allowlist)| (ConsoleRedirectNodeInfo(node_info), ip_allowlist))
     }
 }
 
@@ -102,7 +109,7 @@ async fn authenticate(
     auth_config: &'static AuthenticationConfig,
     link_uri: &reqwest::Url,
     client: &mut PqStream<impl AsyncRead + AsyncWrite + Unpin>,
-) -> auth::Result<NodeInfo> {
+) -> auth::Result<(NodeInfo, Option<Vec<IpPattern>>)> {
     ctx.set_auth_method(crate::context::AuthMethod::ConsoleRedirect);
 
     // registering waiter can fail if we get unlucky with rng.
@@ -117,7 +124,11 @@ async fn authenticate(
     };
 
     let span = info_span!("console_redirect", psql_session_id = &psql_session_id);
-    let greeting = hello_message(link_uri, &psql_session_id);
+    let greeting = hello_message(
+        link_uri,
+        &psql_session_id,
+        auth_config.console_redirect_confirmation_timeout,
+    );
 
     // Give user a URL to spawn a new database.
     info!(parent: &span, "sending the auth URL to the user");
@@ -150,12 +161,8 @@ async fn authenticate(
 
     // This config should be self-contained, because we won't
     // take username or dbname from client's startup message.
-    let mut config = compute::ConnCfg::new();
-    config
-        .host(&db_info.host)
-        .port(db_info.port)
-        .dbname(&db_info.dbname)
-        .user(&db_info.user);
+    let mut config = compute::ConnCfg::new(db_info.host.to_string(), db_info.port);
+    config.dbname(&db_info.dbname).user(&db_info.user);
 
     ctx.set_dbname(db_info.dbname.into());
     ctx.set_user(db_info.user.into());
@@ -176,9 +183,12 @@ async fn authenticate(
         config.password(password.as_ref());
     }
 
-    Ok(NodeInfo {
-        config,
-        aux: db_info.aux,
-        allow_self_signed_compute: false, // caller may override
-    })
+    Ok((
+        NodeInfo {
+            config,
+            aux: db_info.aux,
+            allow_self_signed_compute: false, // caller may override
+        },
+        db_info.allowed_ips,
+    ))
 }

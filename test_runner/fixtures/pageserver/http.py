@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import dataclasses
+import json
+import random
+import string
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -10,7 +14,14 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from fixtures.common_types import Lsn, TenantId, TenantShardId, TimelineArchivalState, TimelineId
+from fixtures.common_types import (
+    Id,
+    Lsn,
+    TenantId,
+    TenantShardId,
+    TimelineArchivalState,
+    TimelineId,
+)
 from fixtures.log_helper import log
 from fixtures.metrics import Metrics, MetricsGetter, parse_metrics
 from fixtures.pg_version import PgVersion
@@ -22,6 +33,69 @@ class PageserverApiException(Exception):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
+
+
+@dataclass
+class ImportPgdataIdemptencyKey:
+    key: str
+
+    @staticmethod
+    def random() -> ImportPgdataIdemptencyKey:
+        return ImportPgdataIdemptencyKey(
+            "".join(random.choices(string.ascii_letters + string.digits, k=20))
+        )
+
+
+@dataclass
+class LocalFs:
+    path: str
+
+
+@dataclass
+class AwsS3:
+    region: str
+    bucket: str
+    key: str
+
+
+@dataclass
+class ImportPgdataLocation:
+    LocalFs: None | LocalFs = None
+    AwsS3: None | AwsS3 = None
+
+
+@dataclass
+class TimelineCreateRequestModeImportPgdata:
+    location: ImportPgdataLocation
+    idempotency_key: ImportPgdataIdemptencyKey
+
+
+@dataclass
+class TimelineCreateRequestMode:
+    Branch: None | dict[str, Any] = None
+    Bootstrap: None | dict[str, Any] = None
+    ImportPgdata: None | TimelineCreateRequestModeImportPgdata = None
+
+
+@dataclass
+class TimelineCreateRequest:
+    new_timeline_id: TimelineId
+    mode: TimelineCreateRequestMode
+
+    def to_json(self) -> str:
+        class EnhancedJSONEncoder(json.JSONEncoder):
+            def default(self, o):
+                if dataclasses.is_dataclass(o) and not isinstance(o, type):
+                    return dataclasses.asdict(o)
+                elif isinstance(o, Id):
+                    return o.id.hex()
+                return super().default(o)
+
+        # mode is flattened
+        this = dataclasses.asdict(self)
+        mode = this.pop("mode")
+        this.update(mode)
+        return json.dumps(self, cls=EnhancedJSONEncoder)
 
 
 class TimelineCreate406(PageserverApiException):
@@ -343,7 +417,7 @@ class PageserverHttpClient(requests.Session, MetricsGetter):
         assert isinstance(res_json["tenant_shards"], list)
         return res_json
 
-    def tenant_get_location(self, tenant_id: TenantShardId):
+    def tenant_get_location(self, tenant_id: TenantId | TenantShardId):
         res = self.get(
             f"http://localhost:{self.port}/v1/location_config/{tenant_id}",
         )
@@ -414,7 +488,20 @@ class PageserverHttpClient(requests.Session, MetricsGetter):
         )
         self.verbose_error(res)
 
-    def patch_tenant_config_client_side(
+    def patch_tenant_config(self, tenant_id: TenantId | TenantShardId, updates: dict[str, Any]):
+        """
+        Only use this via storage_controller.pageserver_api().
+
+        See `set_tenant_config` for more information.
+        """
+        assert "tenant_id" not in updates.keys()
+        res = self.patch(
+            f"http://localhost:{self.port}/v1/tenant/config",
+            json={**updates, "tenant_id": str(tenant_id)},
+        )
+        self.verbose_error(res)
+
+    def update_tenant_config(
         self,
         tenant_id: TenantId,
         inserts: dict[str, Any] | None = None,
@@ -425,13 +512,13 @@ class PageserverHttpClient(requests.Session, MetricsGetter):
 
         See `set_tenant_config` for more information.
         """
-        current = self.tenant_config(tenant_id).tenant_specific_overrides
-        if inserts is not None:
-            current.update(inserts)
-        if removes is not None:
-            for key in removes:
-                del current[key]
-        self.set_tenant_config(tenant_id, current)
+        if inserts is None:
+            inserts = {}
+        if removes is None:
+            removes = []
+
+        patch = inserts | {remove: None for remove in removes}
+        self.patch_tenant_config(tenant_id, patch)
 
     def tenant_size(self, tenant_id: TenantId | TenantShardId) -> int:
         return self.tenant_size_and_modelinputs(tenant_id)[0]
@@ -776,6 +863,7 @@ class PageserverHttpClient(requests.Session, MetricsGetter):
         force_repartition=False,
         force_image_layer_creation=False,
         force_l0_compaction=False,
+        wait_until_flushed=True,
         wait_until_uploaded=False,
         compact: bool | None = None,
         **kwargs,
@@ -788,13 +876,17 @@ class PageserverHttpClient(requests.Session, MetricsGetter):
             query["force_image_layer_creation"] = "true"
         if force_l0_compaction:
             query["force_l0_compaction"] = "true"
+        if not wait_until_flushed:
+            query["wait_until_flushed"] = "false"
         if wait_until_uploaded:
             query["wait_until_uploaded"] = "true"
 
         if compact is not None:
             query["compact"] = "true" if compact else "false"
 
-        log.info(f"Requesting checkpoint: tenant {tenant_id}, timeline {timeline_id}")
+        log.info(
+            f"Requesting checkpoint: tenant={tenant_id} timeline={timeline_id} wait_until_flushed={wait_until_flushed} wait_until_uploaded={wait_until_uploaded} compact={compact}"
+        )
         res = self.put(
             f"http://localhost:{self.port}/v1/tenant/{tenant_id}/timeline/{timeline_id}/checkpoint",
             params=query,

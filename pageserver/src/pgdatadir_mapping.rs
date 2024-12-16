@@ -10,6 +10,9 @@ use super::tenant::{PageReconstructError, Timeline};
 use crate::aux_file;
 use crate::context::RequestContext;
 use crate::keyspace::{KeySpace, KeySpaceAccum};
+use crate::metrics::{
+    RELSIZE_CACHE_ENTRIES, RELSIZE_CACHE_HITS, RELSIZE_CACHE_MISSES, RELSIZE_CACHE_MISSES_OLD,
+};
 use crate::span::{
     debug_assert_current_span_has_tenant_and_timeline_id,
     debug_assert_current_span_has_tenant_and_timeline_id_no_shard_id,
@@ -200,9 +203,13 @@ impl Timeline {
     ) -> Result<Bytes, PageReconstructError> {
         match version {
             Version::Lsn(effective_lsn) => {
-                let pages = smallvec::smallvec![(tag, blknum)];
+                let pages: smallvec::SmallVec<[_; 1]> = smallvec::smallvec![(tag, blknum)];
                 let res = self
-                    .get_rel_page_at_lsn_batched(pages, effective_lsn, ctx)
+                    .get_rel_page_at_lsn_batched(
+                        pages.iter().map(|(tag, blknum)| (tag, blknum)),
+                        effective_lsn,
+                        ctx,
+                    )
                     .await;
                 assert_eq!(res.len(), 1);
                 res.into_iter().next().unwrap()
@@ -237,7 +244,7 @@ impl Timeline {
     /// The ordering of the returned vec corresponds to the ordering of `pages`.
     pub(crate) async fn get_rel_page_at_lsn_batched(
         &self,
-        pages: smallvec::SmallVec<[(RelTag, BlockNumber); 1]>,
+        pages: impl ExactSizeIterator<Item = (&RelTag, &BlockNumber)>,
         effective_lsn: Lsn,
         ctx: &RequestContext,
     ) -> Vec<Result<Bytes, PageReconstructError>> {
@@ -251,7 +258,7 @@ impl Timeline {
         let result_slots = result.spare_capacity_mut();
 
         let mut keys_slots: BTreeMap<Key, smallvec::SmallVec<[usize; 1]>> = BTreeMap::default();
-        for (response_slot_idx, (tag, blknum)) in pages.into_iter().enumerate() {
+        for (response_slot_idx, (tag, blknum)) in pages.enumerate() {
             if tag.relnode == 0 {
                 result_slots[response_slot_idx].write(Err(PageReconstructError::Other(
                     RelationError::InvalidRelnode.into(),
@@ -262,7 +269,7 @@ impl Timeline {
             }
 
             let nblocks = match self
-                .get_rel_size(tag, Version::Lsn(effective_lsn), ctx)
+                .get_rel_size(*tag, Version::Lsn(effective_lsn), ctx)
                 .await
             {
                 Ok(nblocks) => nblocks,
@@ -273,7 +280,7 @@ impl Timeline {
                 }
             };
 
-            if blknum >= nblocks {
+            if *blknum >= nblocks {
                 debug!(
                     "read beyond EOF at {} blk {} at {}, size is {}: returning all-zeros page",
                     tag, blknum, effective_lsn, nblocks
@@ -283,7 +290,7 @@ impl Timeline {
                 continue;
             }
 
-            let key = rel_block_to_key(tag, blknum);
+            let key = rel_block_to_key(*tag, *blknum);
 
             let key_slots = keys_slots.entry(key).or_default();
             key_slots.push(response_slot_idx);
@@ -389,7 +396,9 @@ impl Timeline {
         result
     }
 
-    // Get size of a database in blocks
+    /// Get size of a database in blocks. This is only accurate on shard 0. It will undercount on
+    /// other shards, by only accounting for relations the shard has pages for, and only accounting
+    /// for pages up to the highest page number it has stored.
     pub(crate) async fn get_db_size(
         &self,
         spcnode: Oid,
@@ -408,7 +417,10 @@ impl Timeline {
         Ok(total_blocks)
     }
 
-    /// Get size of a relation file
+    /// Get size of a relation file. The relation must exist, otherwise an error is returned.
+    ///
+    /// This is only accurate on shard 0. On other shards, it will return the size up to the highest
+    /// page number stored in the shard.
     pub(crate) async fn get_rel_size(
         &self,
         tag: RelTag,
@@ -444,7 +456,10 @@ impl Timeline {
         Ok(nblocks)
     }
 
-    /// Does relation exist?
+    /// Does the relation exist?
+    ///
+    /// Only shard 0 has a full view of the relations. Other shards only know about relations that
+    /// the shard stores pages for.
     pub(crate) async fn get_rel_exists(
         &self,
         tag: RelTag,
@@ -477,6 +492,9 @@ impl Timeline {
     }
 
     /// Get a list of all existing relations in given tablespace and database.
+    ///
+    /// Only shard 0 has a full view of the relations. Other shards only know about relations that
+    /// the shard stores pages for.
     ///
     /// # Cancel-Safety
     ///
@@ -512,6 +530,7 @@ impl Timeline {
         lsn: Lsn,
         ctx: &RequestContext,
     ) -> Result<Bytes, PageReconstructError> {
+        assert!(self.tenant_shard_id.is_shard_zero());
         let n_blocks = self
             .get_slru_segment_size(kind, segno, Version::Lsn(lsn), ctx)
             .await?;
@@ -534,6 +553,7 @@ impl Timeline {
         lsn: Lsn,
         ctx: &RequestContext,
     ) -> Result<Bytes, PageReconstructError> {
+        assert!(self.tenant_shard_id.is_shard_zero());
         let key = slru_block_to_key(kind, segno, blknum);
         self.get(key, lsn, ctx).await
     }
@@ -546,6 +566,7 @@ impl Timeline {
         version: Version<'_>,
         ctx: &RequestContext,
     ) -> Result<BlockNumber, PageReconstructError> {
+        assert!(self.tenant_shard_id.is_shard_zero());
         let key = slru_segment_size_to_key(kind, segno);
         let mut buf = version.get(self, key, ctx).await?;
         Ok(buf.get_u32_le())
@@ -559,6 +580,7 @@ impl Timeline {
         version: Version<'_>,
         ctx: &RequestContext,
     ) -> Result<bool, PageReconstructError> {
+        assert!(self.tenant_shard_id.is_shard_zero());
         // fetch directory listing
         let key = slru_dir_to_key(kind);
         let buf = version.get(self, key, ctx).await?;
@@ -1029,26 +1051,28 @@ impl Timeline {
         }
 
         // Iterate SLRUs next
-        for kind in [
-            SlruKind::Clog,
-            SlruKind::MultiXactMembers,
-            SlruKind::MultiXactOffsets,
-        ] {
-            let slrudir_key = slru_dir_to_key(kind);
-            result.add_key(slrudir_key);
-            let buf = self.get(slrudir_key, lsn, ctx).await?;
-            let dir = SlruSegmentDirectory::des(&buf)?;
-            let mut segments: Vec<u32> = dir.segments.iter().cloned().collect();
-            segments.sort_unstable();
-            for segno in segments {
-                let segsize_key = slru_segment_size_to_key(kind, segno);
-                let mut buf = self.get(segsize_key, lsn, ctx).await?;
-                let segsize = buf.get_u32_le();
+        if self.tenant_shard_id.is_shard_zero() {
+            for kind in [
+                SlruKind::Clog,
+                SlruKind::MultiXactMembers,
+                SlruKind::MultiXactOffsets,
+            ] {
+                let slrudir_key = slru_dir_to_key(kind);
+                result.add_key(slrudir_key);
+                let buf = self.get(slrudir_key, lsn, ctx).await?;
+                let dir = SlruSegmentDirectory::des(&buf)?;
+                let mut segments: Vec<u32> = dir.segments.iter().cloned().collect();
+                segments.sort_unstable();
+                for segno in segments {
+                    let segsize_key = slru_segment_size_to_key(kind, segno);
+                    let mut buf = self.get(segsize_key, lsn, ctx).await?;
+                    let segsize = buf.get_u32_le();
 
-                result.add_range(
-                    slru_block_to_key(kind, segno, 0)..slru_block_to_key(kind, segno, segsize),
-                );
-                result.add_key(segsize_key);
+                    result.add_range(
+                        slru_block_to_key(kind, segno, 0)..slru_block_to_key(kind, segno, segsize),
+                    );
+                    result.add_key(segsize_key);
+                }
             }
         }
 
@@ -1129,9 +1153,12 @@ impl Timeline {
         let rel_size_cache = self.rel_size_cache.read().unwrap();
         if let Some((cached_lsn, nblocks)) = rel_size_cache.map.get(tag) {
             if lsn >= *cached_lsn {
+                RELSIZE_CACHE_HITS.inc();
                 return Some(*nblocks);
             }
+            RELSIZE_CACHE_MISSES_OLD.inc();
         }
+        RELSIZE_CACHE_MISSES.inc();
         None
     }
 
@@ -1156,6 +1183,7 @@ impl Timeline {
             }
             hash_map::Entry::Vacant(entry) => {
                 entry.insert((lsn, nblocks));
+                RELSIZE_CACHE_ENTRIES.inc();
             }
         }
     }
@@ -1163,13 +1191,17 @@ impl Timeline {
     /// Store cached relation size
     pub fn set_cached_rel_size(&self, tag: RelTag, lsn: Lsn, nblocks: BlockNumber) {
         let mut rel_size_cache = self.rel_size_cache.write().unwrap();
-        rel_size_cache.map.insert(tag, (lsn, nblocks));
+        if rel_size_cache.map.insert(tag, (lsn, nblocks)).is_none() {
+            RELSIZE_CACHE_ENTRIES.inc();
+        }
     }
 
     /// Remove cached relation size
     pub fn remove_cached_rel_size(&self, tag: &RelTag) {
         let mut rel_size_cache = self.rel_size_cache.write().unwrap();
-        rel_size_cache.map.remove(tag);
+        if rel_size_cache.map.remove(tag).is_some() {
+            RELSIZE_CACHE_ENTRIES.dec();
+        }
     }
 }
 
@@ -1229,10 +1261,9 @@ impl<'a> DatadirModification<'a> {
     }
 
     pub(crate) fn has_dirty_data(&self) -> bool {
-        !self
-            .pending_data_batch
+        self.pending_data_batch
             .as_ref()
-            .map_or(true, |b| b.is_empty())
+            .map_or(false, |b| b.has_data())
     }
 
     /// Set the current lsn
@@ -1408,7 +1439,7 @@ impl<'a> DatadirModification<'a> {
             Some(pending_batch) => {
                 pending_batch.extend(batch);
             }
-            None if !batch.is_empty() => {
+            None if batch.has_data() => {
                 self.pending_data_batch = Some(batch);
             }
             None => {
@@ -1443,6 +1474,10 @@ impl<'a> DatadirModification<'a> {
         blknum: BlockNumber,
         rec: NeonWalRecord,
     ) -> anyhow::Result<()> {
+        if !self.tline.tenant_shard_id.is_shard_zero() {
+            return Ok(());
+        }
+
         self.put(
             slru_block_to_key(kind, segno, blknum),
             Value::WalRecord(rec),
@@ -1476,6 +1511,8 @@ impl<'a> DatadirModification<'a> {
         blknum: BlockNumber,
         img: Bytes,
     ) -> anyhow::Result<()> {
+        assert!(self.tline.tenant_shard_id.is_shard_zero());
+
         let key = slru_block_to_key(kind, segno, blknum);
         if !key.is_valid_key_on_write_path() {
             anyhow::bail!(
@@ -1517,6 +1554,7 @@ impl<'a> DatadirModification<'a> {
         segno: u32,
         blknum: BlockNumber,
     ) -> anyhow::Result<()> {
+        assert!(self.tline.tenant_shard_id.is_shard_zero());
         let key = slru_block_to_key(kind, segno, blknum);
         if !key.is_valid_key_on_write_path() {
             anyhow::bail!(
@@ -1828,6 +1866,8 @@ impl<'a> DatadirModification<'a> {
         nblocks: BlockNumber,
         ctx: &RequestContext,
     ) -> anyhow::Result<()> {
+        assert!(self.tline.tenant_shard_id.is_shard_zero());
+
         // Add it to the directory entry
         let dir_key = slru_dir_to_key(kind);
         let buf = self.get(dir_key, ctx).await?;
@@ -1860,6 +1900,8 @@ impl<'a> DatadirModification<'a> {
         segno: u32,
         nblocks: BlockNumber,
     ) -> anyhow::Result<()> {
+        assert!(self.tline.tenant_shard_id.is_shard_zero());
+
         // Put size
         let size_key = slru_segment_size_to_key(kind, segno);
         let buf = nblocks.to_le_bytes();
@@ -2276,9 +2318,9 @@ impl<'a> Version<'a> {
 //--- Metadata structs stored in key-value pairs in the repository.
 
 #[derive(Debug, Serialize, Deserialize)]
-struct DbDirectory {
+pub(crate) struct DbDirectory {
     // (spcnode, dbnode) -> (do relmapper and PG_VERSION files exist)
-    dbdirs: HashMap<(Oid, Oid), bool>,
+    pub(crate) dbdirs: HashMap<(Oid, Oid), bool>,
 }
 
 // The format of TwoPhaseDirectory changed in PostgreSQL v17, because the filenames of
@@ -2287,8 +2329,8 @@ struct DbDirectory {
 // "pg_twophsae/0000000A000002E4".
 
 #[derive(Debug, Serialize, Deserialize)]
-struct TwoPhaseDirectory {
-    xids: HashSet<TransactionId>,
+pub(crate) struct TwoPhaseDirectory {
+    pub(crate) xids: HashSet<TransactionId>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2297,12 +2339,12 @@ struct TwoPhaseDirectoryV17 {
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
-struct RelDirectory {
+pub(crate) struct RelDirectory {
     // Set of relations that exist. (relfilenode, forknum)
     //
     // TODO: Store it as a btree or radix tree or something else that spans multiple
     // key-value pairs, if you have a lot of relations
-    rels: HashSet<(Oid, u8)>,
+    pub(crate) rels: HashSet<(Oid, u8)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2311,9 +2353,9 @@ struct RelSizeEntry {
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
-struct SlruSegmentDirectory {
+pub(crate) struct SlruSegmentDirectory {
     // Set of SLRU segments that exist.
-    segments: HashSet<u32>,
+    pub(crate) segments: HashSet<u32>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, enum_map::Enum)]
